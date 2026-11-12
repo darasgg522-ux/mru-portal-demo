@@ -1,21 +1,3 @@
-/*
- * MRU Unified Student / Teacher Portal — C++ demonstration backend
- * --------------------------------------------------------------
- * HOW THE PARTS FIT TOGETHER
- *   Browser (index.html / JavaScript)
- *       -> HTTP request -> handle() -> logical service functions / mutate()
- *       -> in-memory request/response objects -> SQLite relational tables (portal.db)
- *
- * Authentication: /api/login identifies a demo account and stores a session token.
- * Course service: courseDetails() reads course data and a teacher roster.
- * Assignment / grading service: mutate() creates tasks, accepts student work,
- *   saves grades and feedback, and updates the shared weekly schedule.
- * Files: attachments are written to uploads/; metadata goes into SQLite.
- * The Boost.JSON library remains for HTTP request/response payloads, NOT file storage.
- *
- * This is an educational, single-process local demo, not production software.
- * Demo passwords are public. This is not a production authentication system.
- */
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/json.hpp>
@@ -529,9 +511,24 @@ Response response(http::status status,json::value payload){
     Response r{status,11};r.set(http::field::content_type,"application/json; charset=utf-8");
     r.set(http::field::cache_control,"no-store");r.body()=json::serialize(payload);r.prepare_payload();return r;
 }
+// Normalize the request target before routing. Proxies and browsers can add query
+// strings (e.g. /?source=render), and HTTP also permits absolute-form URLs.
+// Route matching must use only the pathname, not the full target string.
+std::string routePath(const Request& req){
+    std::string path(req.target());
+    if(path.rfind("http://",0)==0 || path.rfind("https://",0)==0){
+        const auto schemeEnd=path.find("://")+3;
+        const auto firstSlash=path.find('/',schemeEnd);
+        path=firstSlash==std::string::npos?"/":path.substr(firstSlash);
+    }
+    const auto query=path.find_first_of("?#");
+    if(query!=std::string::npos)path.resize(query);
+    if(path.empty())path="/";
+    return path;
+}
 // HTTP router: serve the frontend, authenticate, check sessions and dispatch API requests.
 Response handle(const Request& req){
-    auto path=std::string(req.target());
+    auto path=routePath(req);
     // Serve the HTML frontend through the same local server as the API.
     if(req.method()==http::verb::get&&(path=="/"||path=="/index.html")){
         std::ifstream in(base/"index.html",std::ios::binary);
@@ -539,9 +536,11 @@ Response handle(const Request& req){
         Response r{http::status::ok,11};r.set(http::field::content_type,"text/html; charset=utf-8");
         r.set(http::field::cache_control,"no-store");r.body()=std::string((std::istreambuf_iterator<char>(in)),{});r.prepare_payload();return r;
     }
-    if(req.method()==http::verb::get&&path=="/api/health")
-        return response(http::status::ok,
-            Object{{"ok",true},{"backend","C++ / Boost.Beast"}});
+    if(req.method()==http::verb::get&&path=="/api/health")return response(http::status::ok,Object{{"ok",true},{"backend","C++ / Boost.Beast"}});
+    // A missing website page should never be confused with a login failure.
+    // Only /api/* endpoints need a session; / and /index.html remain public.
+    if(path.rfind("/api/",0)!=0)
+        return response(http::status::not_found,result(false,"Unknown website path: "+path));
     try{
         std::lock_guard<std::mutex> lock(guard);
         // Authenticate a demo account and return the server-determined teacher/student role.
@@ -647,6 +646,10 @@ int main(int argc,char** argv){
                 http::read(socket,buffer,parser);
                 Request req=parser.release();
                 auto res=handle(req);res.keep_alive(false);
+                // Diagnostic: log method, exact incoming target, normalized path,
+                // and HTTP status. Do NOT log authorization headers or passwords.
+                std::cout<<"HTTP "<<req.method_string()<<" "<<req.target()
+                         <<" [path="<<routePath(req)<<"] -> "<<res.result_int()<<"\n"<<std::flush;
                 http::write(socket,res);
                 beast::error_code ec;socket.shutdown(tcp::socket::shutdown_both,ec);
             }catch(const std::exception& e){std::cerr<<"Request error: "<<e.what()<<"\n";}
