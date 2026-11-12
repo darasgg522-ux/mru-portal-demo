@@ -643,7 +643,20 @@ int main(int argc,char** argv){
                 beast::flat_buffer buffer;
                 http::request_parser<http::string_body> parser;
                 parser.body_limit(9*1024*1024);
-                http::read(socket,buffer,parser);
+                // Some cloud load balancers and browsers open a TCP connection
+                // then close it without sending an HTTP request. Boost.Beast
+                // reports this as end_of_stream: it is not an application error.
+                beast::error_code readError;
+                http::read(socket,buffer,parser,readError);
+                if(readError==http::error::end_of_stream || readError==asio::error::eof){
+                    // Expected disconnect before a request; do not flood Render logs.
+                    continue;
+                }
+                if(readError){
+                    // Keep genuine HTTP parsing / network failures visible.
+                    std::cerr<<"Request read error: "<<readError.message()<<"\n";
+                    continue;
+                }
                 Request req=parser.release();
                 auto res=handle(req);res.keep_alive(false);
                 // Diagnostic: log method, exact incoming target, normalized path,
