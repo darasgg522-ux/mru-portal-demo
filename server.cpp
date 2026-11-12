@@ -539,7 +539,9 @@ Response handle(const Request& req){
         Response r{http::status::ok,11};r.set(http::field::content_type,"text/html; charset=utf-8");
         r.set(http::field::cache_control,"no-store");r.body()=std::string((std::istreambuf_iterator<char>(in)),{});r.prepare_payload();return r;
     }
-    if(req.method()==http::verb::get&&path=="/api/health")return response(http::status::ok,Object{{"ok",true},{"backend","C++ / Boost.Beast"}});
+    if(req.method()==http::verb::get&&path=="/api/health")
+        return response(http::status::ok,
+            Object{{"ok",true},{"backend","C++ / Boost.Beast"}});
     try{
         std::lock_guard<std::mutex> lock(guard);
         // Authenticate a demo account and return the server-determined teacher/student role.
