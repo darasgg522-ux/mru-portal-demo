@@ -125,6 +125,12 @@ bool canDownload(const std::string& id,const std::string& role){
         for(const auto& t:state.as_object().at("tasks").as_array())
             if(num(t.as_object(),"id")==num(s,"task"))return validCourse(num(t.as_object(),"course"));
     }
+    // Course learning materials are downloadable by students and teachers.
+    for(const auto& material:state.as_object().at("materials").as_array()){
+        const auto& m=material.as_object();auto it=m.find("file");
+        if(it!=m.end()&&it->value().is_object()&&str(it->value().as_object(),"id")==id)
+            return role=="student"||validCourse(num(m,"course"));
+    }
     return false;
 }
 // Create initial demonstration records for a brand-new SQLite database.
@@ -219,7 +225,8 @@ void initializeDb(){
         );
         CREATE TABLE IF NOT EXISTS materials (
           id INTEGER PRIMARY KEY, course INTEGER NOT NULL,
-          title TEXT NOT NULL, description TEXT NOT NULL DEFAULT ''
+          title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+          file_id TEXT, file_name TEXT, file_size INTEGER
         );
         CREATE TABLE IF NOT EXISTS submissions (
           id INTEGER PRIMARY KEY, task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -236,6 +243,20 @@ void initializeDb(){
           attendance_key TEXT PRIMARY KEY, present INTEGER NOT NULL CHECK(present IN (0,1))
         );
     )SQL");
+    // Upgrade existing SQLite databases without deleting saved learning materials.
+    bool hasFileId=false,hasFileName=false,hasFileSize=false;
+    {
+        Stmt columns("PRAGMA table_info(materials)");
+        while(sqlite3_step(columns.ptr)==SQLITE_ROW){
+            const auto name=columnText(columns.ptr,1);
+            if(name=="file_id")hasFileId=true;
+            if(name=="file_name")hasFileName=true;
+            if(name=="file_size")hasFileSize=true;
+        }
+    }
+    if(!hasFileId)sqlExec("ALTER TABLE materials ADD COLUMN file_id TEXT;");
+    if(!hasFileName)sqlExec("ALTER TABLE materials ADD COLUMN file_name TEXT;");
+    if(!hasFileSize)sqlExec("ALTER TABLE materials ADD COLUMN file_size INTEGER;");
 }
 // Persist changes as one atomic transaction. Small demo datasets make full-table
 // synchronization straightforward; a production app would update changed rows only.
@@ -254,11 +275,12 @@ void save(){
             tasks.string(5,str(t,"due"));tasks.string(6,str(t,"desc"));
             tasks.string(7,str(t,"type","standard"));bindFile(tasks,8,t);tasks.step();
         }
-        Stmt materials("INSERT INTO materials(id,course,title,description) VALUES(?,?,?,?)");
+        Stmt materials("INSERT INTO materials(id,course,title,description,file_id,file_name,file_size) VALUES(?,?,?,?,?,?,?)");
         for(const auto& item:root.at("materials").as_array()){
             const auto& m=item.as_object();materials.reset();
             materials.integer(1,num(m,"id"));materials.integer(2,num(m,"course"));
-            materials.string(3,str(m,"title"));materials.string(4,str(m,"desc"));materials.step();
+            materials.string(3,str(m,"title"));materials.string(4,str(m,"desc"));
+            bindFile(materials,5,m);materials.step();
         }
         Stmt submissions("INSERT INTO submissions(id,task,student,answer,submitted_date,grade,feedback,file_id,file_name,file_size) VALUES(?,?,?,?,?,?,?,?,?,?)");
         for(const auto& item:root.at("submissions").as_array()){
@@ -298,12 +320,13 @@ void readDb(){
         }
     }
     {
-        Stmt q("SELECT id,course,title,description FROM materials ORDER BY id DESC");
+        Stmt q("SELECT id,course,title,description,file_id,file_name,file_size FROM materials ORDER BY id DESC");
         while(sqlite3_step(q.ptr)==SQLITE_ROW){
-            root.at("materials").as_array().push_back(Object{
-                {"id",sqlite3_column_int64(q.ptr,0)},
+            Object material{{"id",sqlite3_column_int64(q.ptr,0)},
                 {"course",sqlite3_column_int64(q.ptr,1)},
-                {"title",columnText(q.ptr,2)},{"desc",columnText(q.ptr,3)}});
+                {"title",columnText(q.ptr,2)},{"desc",columnText(q.ptr,3)}};
+            addFile(material,q.ptr,4);
+            root.at("materials").as_array().push_back(std::move(material));
         }
     }
     {
@@ -428,11 +451,29 @@ Object mutate(const std::string& role,const Object& req){
         auto id=num(req,"id");if(!findId(tasks,id))return result(false,"Assignment not found");
         tasks.erase(std::remove_if(tasks.begin(),tasks.end(),[&](const auto& x){return num(x.as_object(),"id")==id;}),tasks.end());
         subs.erase(std::remove_if(subs.begin(),subs.end(),[&](const auto& x){return num(x.as_object(),"task")==id;}),subs.end());
-    // TEACHER: add a course material record.
+    // TEACHER: add a learning material with an optional downloadable file.
     }else if(op=="addMaterial"&&teacherOnly()){
-        auto c=num(req,"course");auto title=str(req,"title");
-        if(!validCourse(c)||title.empty()||title.size()>180)return result(false,"Invalid material");
-        mats.insert(mats.begin(),Object{{"id",nextId++},{"course",c},{"title",title},{"desc",str(req,"desc")}});
+        auto c=num(req,"course");auto title=str(req,"title"),desc=str(req,"desc");
+        if(!validCourse(c)||title.empty()||title.size()>180||desc.size()>30000)
+            return result(false,"Invalid material");
+        Object material{{"id",nextId++},{"course",c},{"title",title},{"desc",desc}};
+        if(auto it=req.find("file");it!=req.end()&&!it->value().is_null())
+            material["file"]=saveAttachment(it->value());
+        mats.insert(mats.begin(),std::move(material));
+    // TEACHER: edit material details, optionally replacing or removing its file.
+    }else if(op=="updateMaterial"&&teacherOnly()){
+        auto* material=findId(mats,num(req,"id"));
+        if(!material||!validCourse(num(*material,"course")))return result(false,"Material unavailable");
+        auto c=num(req,"course");auto title=str(req,"title"),desc=str(req,"desc");
+        if(!validCourse(c)||title.empty()||title.size()>180||desc.size()>30000)
+            return result(false,"Invalid material");
+        Object newFile;
+        auto it=req.find("file");bool hasFile=it!=req.end()&&!it->value().is_null();
+        if(hasFile)newFile=saveAttachment(it->value());
+        (*material)["course"]=c;(*material)["title"]=title;(*material)["desc"]=desc;
+        if(hasFile)(*material)["file"]=std::move(newFile);
+        else if(auto rem=req.find("removeFile");rem!=req.end()&&rem->value().is_bool()&&rem->value().as_bool())
+            material->erase("file");
     // TEACHER: remove a course material record.
     }else if(op=="removeMaterial"&&teacherOnly()){
         auto id=num(req,"id");if(!findId(mats,id))return result(false,"Material not found");
